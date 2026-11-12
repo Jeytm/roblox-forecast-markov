@@ -1,4 +1,4 @@
-"""Markov rank-transition Monte Carlo forecaster.
+"""Final Markov rank-transition Monte Carlo forecaster.
 
 Predicts the Roblox "Up-and-Coming" top 10 from a history of chart
 snapshots. Learns place-to-place transition distributions from
