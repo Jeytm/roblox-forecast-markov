@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""make.fun roblox-up-and-coming-forecast-01 entry.
+"""Final Markov rank-transition Monte Carlo forecaster.
+
+make.fun roblox-up-and-coming-forecast-01 entry.
 
 Markov rank-transition simulation of the Up-and-Coming chart over the 72h window:
 learns place-transition distributions from consecutive history reads (bucketed by
