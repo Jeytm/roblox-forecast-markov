@@ -35,9 +35,13 @@ def bucket(dt_h):
 
 
 def build_transitions(hist):
-    dest = defaultdict(lambda: defaultdict(int))
-    tot = defaultdict(int)
-    for a, b in zip(hist, hist[1:]):
+    dest = defaultdict(lambda: defaultdict(float))
+    tot = defaultdict(float)
+    pairs = list(zip(hist, hist[1:]))
+    n = len(pairs)
+    for idx in range(n):
+        w = 1.0 + idx / n  # recency weighting: newer transitions count more
+        a, b = pairs[idx]
         dt = (parse(b["at"]) - parse(a["at"])).total_seconds() / 3600.0
         pa = {g["universe_id"]: g["rank"] for g in a["up_and_coming"]}
         pb = {g["universe_id"]: g["rank"] for g in b["up_and_coming"]}
@@ -45,8 +49,8 @@ def build_transitions(hist):
             i = pa[uid]
             j = pb.get(uid)
             key = (bucket(dt), i)
-            dest[key][j if j else 0] += 1  # 0 = left the chart
-            tot[key] += 1
+            dest[key][j if j else 0] += w  # 0 = left the chart
+            tot[key] += w
     return dest, tot
 
 
