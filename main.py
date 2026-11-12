@@ -103,24 +103,6 @@ def simulate(last, dest, tot, pool):
     return occupancy
 
 
-def forecast_from(occupancy, chart):
-    probs = []
-    for k in range(1, 11):
-        occ = occupancy[k]
-        items = sorted(occ.items(), key=lambda x: (-x[1], x[0]))
-        for uid, c in items[:NAMED_PER_PLACE]:
-            p = c / SIMS
-            if p < P_FLOOR:
-                continue
-            probs.append({"universe_id": uid, "place": k, "p": round(p, 4)})
-    total_occ = defaultdict(float)
-    for k in range(1, 11):
-        for uid, c in occupancy[k].items():
-            total_occ[uid] += c
-    top10 = [uid for uid, _ in sorted(total_occ.items(), key=lambda x: (-x[1], x[0]))[:10]]
-    return {"probabilities": probs, "top10": top10}
-
-
 def main():
     hist = []
     with open(os.path.join(IN, "history.ndjson")) as f:
@@ -134,7 +116,20 @@ def main():
     pool = [g["universe_id"] for g in last["up_and_coming"]]
     dest, tot = build_transitions(hist)
     occ = simulate(last, dest, tot, pool)
-    fc = forecast_from(occ, last["up_and_coming"])
+    probs = []
+    for k in range(1, 11):
+        items = sorted(occ[k].items(), key=lambda x: (-x[1], x[0]))
+        for uid, c in items[:NAMED_PER_PLACE]:
+            p = c / SIMS
+            if p < P_FLOOR:
+                continue
+            probs.append({"universe_id": uid, "place": k, "p": round(p, 4)})
+    total_occ = defaultdict(float)
+    for k in range(1, 11):
+        for uid, c in occ[k].items():
+            total_occ[uid] += c
+    top10 = [uid for uid, _ in sorted(total_occ.items(), key=lambda x: (-x[1], x[0]))[:10]]
+    fc = {"probabilities": probs, "top10": top10}
     os.makedirs(OUT, exist_ok=True)
     with open(os.path.join(OUT, "forecast.json"), "w") as f:
         json.dump(fc, f, indent=1, sort_keys=False)
