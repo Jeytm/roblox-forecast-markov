@@ -1,103 +1,82 @@
-"""Final Markov rank-transition Monte Carlo forecaster.
+"""Markov rank-transition Monte Carlo forecaster for the Roblox Up-and-Coming chart.
 
-Predicts the Roblox "Up-and-Coming" top 10 from a history of chart
-snapshots. Learns place-to-place transition distributions from
-consecutive snapshot pairs (bucketed by the time gap between reads,
-weighted by recency), then Monte-Carlo simulates HORIZON_H hours of
-chart evolution with a fixed RNG seed so output is deterministic.
-
-Stdlib only. Reads MAKEFUN_INPUT_DIR/history.ndjson (default /input)
-and writes MAKEFUN_OUTPUT_DIR/forecast.json (default /output).
+Reads chart snapshots from $MAKEFUN_INPUT_DIR/history.ndjson, learns
+gap-bucketed rank transitions from consecutive read pairs, Monte-Carlo
+simulates 72h of chart evolution for each gap bucket (one ensemble member
+per bucket), blends the members, and writes $MAKEFUN_OUTPUT_DIR/forecast.json.
 """
 
 import json
 import os
 import random
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime
 
-SIMS = 600
-HORIZON_H = 72.0
-STEP_H = 6.0
-SEED = 20261113
-NAMED_PER_PLACE = 5
-P_FLOOR = 0.04
+SIMS = 600            # Monte Carlo runs per ensemble member
+HORIZON_H = 72.0      # forecast horizon in hours
+STEP_H = 6.0          # hours per transition step
+SEED = 20261113       # fixed RNG seed: every member/run is deterministic
+NAMED_PER_PLACE = 12  # candidate games named per chart place
+P_FLOOR = 0.01        # minimum probability to report
 
-
-def _parse_ts(s):
-    """Parse an ISO timestamp; normalize naive stamps to UTC."""
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+BUCKETS = ('b1', 'b2', 'b3')  # ensemble members, in blend order
 
 
-def load_history():
-    """Read history.ndjson (one JSON object per line) from the input dir."""
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-    path = os.path.join(in_dir, "history.ndjson")
-    rows = []
-    with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
+def read_history(path):
+    """Load NDJSON reads: keep truthy-ok entries, sorted by 'at' ascending."""
+    reads = []
+    with open(path) as f:
+        for line in f:
             line = line.strip()
             if not line:
                 continue
-            rows.append(json.loads(line))
-    return rows
+            rec = json.loads(line)
+            if not rec.get('ok', True):
+                continue
+            reads.append(rec)
+    reads.sort(key=lambda r: datetime.fromisoformat(r['at']))
+    return reads
+
+
+def bucket_for(gap_h):
+    """Map a read-gap in hours to its transition bucket."""
+    if gap_h < 4:
+        return 'b1'
+    if gap_h < 8:
+        return 'b2'
+    return 'b3'
 
 
 def build_transitions(hist):
-    """Learn place->place transition distributions from consecutive pairs.
+    """Gap-bucketed rank-transition weights from consecutive read pairs.
 
-    Each consecutive pair (A, B) contributes one observation per game in
-    A: its destination rank in B, or 0 if it dropped off the chart. Rows
-    are keyed by (gap bucket, from-rank); observations are weighted by
-    recency (later pairs count more).
-
-    Returns (dest, tot): dest maps key -> {dest_rank: weight},
-    tot maps key -> total weight.
+    dest[(bucket, from_rank)][to_rank] -> accumulated weight; to_rank 0
+    means the game dropped off the chart. Later (more recent) pairs weigh
+    more: w = 1 + pair_index / num_pairs.
     """
     dest = {}
     tot = {}
     num_pairs = len(hist) - 1
-    for pair_index in range(num_pairs):
-        a = hist[pair_index]
-        b = hist[pair_index + 1]
-        hours = (_parse_ts(b["at"]) - _parse_ts(a["at"])).total_seconds() / 3600.0
-        if hours < 4:
-            bucket = "b1"
-        elif hours < 8:
-            bucket = "b2"
-        else:
-            bucket = "b3"
-        w = 1.0 + pair_index / num_pairs
-        rank_b = {e["universe_id"]: e["rank"] for e in b["up_and_coming"]}
-        for e in a["up_and_coming"]:
-            i = e["rank"]
-            j = rank_b.get(e["universe_id"], 0)
-            key = (bucket, i)
-            row = dest.setdefault(key, {})
-            row[j] = row.get(j, 0.0) + w
+    for idx in range(num_pairs):
+        a, b = hist[idx], hist[idx + 1]
+        gap_h = (datetime.fromisoformat(b['at']) - datetime.fromisoformat(a['at'])).total_seconds() / 3600.0
+        bkt = bucket_for(gap_h)
+        b_ranks = {e['universe_id']: e['rank'] for e in b['up_and_coming']}
+        w = 1 + idx / num_pairs
+        for e in a['up_and_coming']:
+            key = (bkt, e['rank'])
+            d = dest.setdefault(key, defaultdict(float))
+            d[b_ranks.get(e['universe_id'], 0)] += w
             tot[key] = tot.get(key, 0.0) + w
     return dest, tot
 
 
-def simulate(last, dest, tot, pool):
-    """Monte-Carlo the chart forward HORIZON_H hours from `last`.
-
-    Runs SIMS simulations with one seeded RNG shared across runs. Each
-    step samples every surviving game's destination from the ('b2',
-    current rank) transition row, drops games that fall off, renumbers
-    the survivors 1..N (ties broken by previous rank), and records how
-    often each game occupies each of the top 10 places.
-
-    Returns occupancy: {place: {universe_id: count}} for places 1..10.
-    """
+def simulate(last, dest, tot, pool, bucket):
+    """Monte-Carlo the chart HORIZON_H ahead for one bucket; return occupancy."""
     rng = random.Random(SEED)
-    cur = {e["universe_id"]: e["rank"] for e in last["up_and_coming"]}
-    order0 = sorted(pool, key=lambda u: cur[u])
-    occupancy = {k: {} for k in range(1, 11)}
+    cur = {e['universe_id']: e['rank'] for e in last['up_and_coming']}
+    order0 = list(pool)
+    occupancy = {r: defaultdict(int) for r in range(1, 11)}
     for _ in range(SIMS):
         pos = dict(cur)
         inchart = set(pool)
@@ -107,7 +86,7 @@ def simulate(last, dest, tot, pool):
             for uid in order0:
                 if uid not in inchart or uid not in pos:
                     continue
-                key = ("b2", pos[uid])
+                key = (bucket, pos[uid])
                 d = dest.get(key, {})
                 tt = tot.get(key, 0)
                 if tt == 0:
@@ -135,54 +114,72 @@ def simulate(last, dest, tot, pool):
             t += STEP_H
         for u, r in pos.items():
             if r <= 10:
-                row = occupancy[r]
-                row[u] = row.get(u, 0) + 1
+                occupancy[r][u] += 1
     return occupancy
 
 
 def forecast_from(occupancy):
-    """Convert occupancy counts into the forecast document.
-
-    probabilities: for each place 1..10, the top NAMED_PER_PLACE games
-    by occupancy whose p = count/SIMS clears P_FLOOR, as rows
-    {universe_id, place, p}. top10: games ranked by total occupancy
-    across places 1..10.
-    """
+    """Turn place-occupancy counts into named rows and a top10 ranking."""
     probabilities = []
-    for k in range(1, 11):
-        row = occupancy.get(k, {})
-        items = sorted(row.items(), key=lambda kv: (-kv[1], kv[0]))
-        for uid, count in items[:NAMED_PER_PLACE]:
+    for place in range(1, 11):
+        named = 0
+        for uid, count in sorted(occupancy[place].items(), key=lambda kv: (-kv[1], kv[0])):
+            if named >= NAMED_PER_PLACE:
+                break
             p = count / SIMS
             if p >= P_FLOOR:
-                probabilities.append(
-                    {"universe_id": uid, "place": k, "p": round(p, 4)}
-                )
-    total_occ = {}
-    for k in range(1, 11):
-        for uid, count in occupancy.get(k, {}).items():
-            total_occ[uid] = total_occ.get(uid, 0) + count
-    top10 = [
-        uid
-        for uid, _ in sorted(total_occ.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
-    ]
-    return {"probabilities": probabilities, "top10": top10}
+                probabilities.append({'universe_id': uid, 'place': place, 'p': round(p, 4)})
+                named += 1
+    totals = defaultdict(int)
+    for place in range(1, 11):
+        for uid, count in occupancy[place].items():
+            totals[uid] += count
+    top10 = [uid for uid, _ in sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))]
+    return probabilities, top10
 
 
 def main():
-    hist = load_history()
-    hist.sort(key=lambda r: r["at"])
-    hist = [r for r in hist if r.get("ok") == True]
+    indir = os.environ.get('MAKEFUN_INPUT_DIR', '/input')
+    hist = read_history(os.path.join(indir, 'history.ndjson'))
     last = hist[-1]
-    pool = [e["universe_id"] for e in last["up_and_coming"]]
+    pool = [e['universe_id'] for e in sorted(last['up_and_coming'], key=lambda e: e['rank'])]
     dest, tot = build_transitions(hist)
-    occ = simulate(last, dest, tot, pool)
-    out = forecast_from(occ)
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "forecast.json"), "w", encoding="utf-8") as fh:
-        json.dump(out, fh)
+
+    member_probs = []
+    member_top10 = []
+    for bucket in BUCKETS:
+        occupancy = simulate(last, dest, tot, pool, bucket)
+        probs, top10 = forecast_from(occupancy)
+        member_probs.append(probs)
+        member_top10.append(top10)
+
+    named = {}
+    n_members = len(member_probs)
+    for probs in member_probs:
+        for row in probs:
+            key = (row['place'], row['universe_id'])
+            named[key] = named.get(key, 0.0) + row['p'] / n_members
+    probabilities = []
+    for (place, uid), p in named.items():
+        if p >= P_FLOOR:
+            probabilities.append({'universe_id': uid, 'place': place, 'p': round(p, 6)})
+    probabilities.sort(key=lambda row: (row['place'], -row['p'], row['universe_id']))
+
+    seen = set()
+    top10 = []
+    for member in member_top10:
+        for uid in member:
+            if uid not in seen:
+                seen.add(uid)
+                top10.append(uid)
+    top10 = top10[:10]
+
+    outdir = os.environ.get('MAKEFUN_OUTPUT_DIR', '/output')
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, 'forecast.json'), 'w') as f:
+        json.dump({'probabilities': probabilities, 'top10': top10}, f, indent=2)
+        f.write('\n')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
